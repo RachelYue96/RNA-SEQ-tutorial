@@ -94,6 +94,7 @@ samtools dict GRCh38.p14_rRNA_rm16dup.fasta > GRCh38.p14_rRNA_rm16dup.dict
 # bowtie2 index 生成索引文件
 bowtie2-build GRCh38.p14_rRNA_rm16dup.fasta GRCh38.p14_rRNA_rm16dup.fasta #~2s
 ```
+
 ### 核心代码 ###
 ```bash
 bowtie2 \
@@ -111,7 +112,216 @@ bowtie2 \
     >> $log_file 2>&1 ## 导出日志文件
 ```
 
+### 结果文件 ###
+![Page Preview](images/rRNA_result.png)
+- 过滤rRNA后的fastq双端数据
+- 包含详细比对信息的bam文件
+- 统计rRNA在样本中占比的txt文件
+    ![Page Preview](images/rRNA-txt.png)
 
+## 第三步：比对到参考基因组
+将过滤掉rRNA序列后的FASTQ数据比对到与样本类型对应的参考基因组FASTA序列上
 
+*完整代码参考 [github](https://github.com/RachelYue96/RNA-SEQ-tutorial) `src/step3_align_genome.sh` 脚本*
 
+### 下载参考基因组 ###
+```bash
+# download the version 110 GRCh38's gtf, mRNA, fasta files
+wget https://ftp.ensembl.org/pub/release-110/gtf/homo_sapiens/Homo_sapiens.GRCh38.110.gtf.gz
+wget https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz
+wget https://ftp.ensembl.org/pub/release-110/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+
+# build hisat2 index for fasta file
+hisat2-build Homo_sapiens.GRCh38.dna.primary_assembly.fa genome_GRCh38_110_index
+```
+
+### 核心代码 ###
+```bash
+hisat2 \
+    --threads 16 \
+    --dta \
+    ## 设定参考基因组
+    -x /share/data/reference/human/hg38/gene/UHRR/ref/genome_index/genome_GRCh38_110_index \
+    ## 过滤rRNA后的双端数据
+    -1 $ddir/${sampleid}.clean.fq.1.gz \
+    -2 $ddir/${sampleid}.clean.fq.2.gz \
+    ## 统计文件
+    --summary-file $odir/${sampleid}.tran_summary.txt \
+    ## 导入samtools，将SAM转为BAM文件
+    | samtools view \
+            --threads 16 \
+            --bam --no-PG /dev/stdin \
+    ## 对BAM文件排序
+    | samtools sort \
+            /dev/stdin \
+            --threads 16 \
+            -o $odir/${sampleid}.tran.sorted.bam \
+    ## 为BAM文件创建索引
+    && samtools index \
+            $odir/${sampleid}.tran.sorted.bam \
+    && stringtie \
+            $odir/${sampleid}.tran.sorted.bam \
+            -p 16 \
+            -G /share/data/reference/human/hg38/gene/UHRR/ref/Homo_sapiens.GRCh38.110.gtf \
+            -e \
+            -b $odir/Ballgown \
+            -o $odir/${sampleid}.tran.gtf \ ## 组装后转路本信息
+    >> $log_file 2>&1 ## 日志文件
+```
+
+### 结果文件 ###
+1. BAM 文件
+![alt text](images/bam.png)
+2. gtf文件
+![alt text](images/gtf.png)
+
+## 第四步：基因和转路本定量
+*完整代码参考 [github](https://github.com/RachelYue96/RNA-SEQ-tutorial) `src/step4_count.sh` 脚本*
+
+### 核心代码 ###
+```bash
+## 输出每个样本基因的表达量，并将结果整理成一个包含基因ID和对应表达量的文本文件
+featureCounts \
+    -p \ ## 输入双端测序数据
+    -T 8 \ ## 线程数
+    -f \ ## 输出feature（特征）级数据
+    ## 指定注释文件
+    -a /share/data/reference/human/hg38/gene/UHRR/ref/Homo_sapiens.GRCh38.110.mRNA.gtf \
+    ## 指定输出文件
+    -o $ddir/${sampleid}_gene_level_counts
+
+less $ddir/${sampleid}_gene_level_counts | grep '^E' | awk '{print \$1\"\\t\"\$NF}' | awk '{sums[\$1] += \$2} END {for (i in sums) print i, sums[i]}' | sort -k1 > $ddir/${sampleid}_allgene.counts.txt
+
+sed -i '1igene_id\tcounts' $ddir/${sampleid}_allgene.counts.txt
+```
+
+```r
+## 使用biomaRt包用来统计基因的表达矩阵
+library('biomaRt')
+
+wkdir <- "/share/result/sequencer/salus/video_example/RNA-seq"
+
+files_allg <- list.files(path=paste0(wkdir, "/results/hisat2_stringtie"), pattern="*_allgene.counts.txt$", full.names=TRUE, recursive=TRUE)
+
+names(files_allg) <- gsub("_allgene.counts.txt$", "", basename(files_allg))
+exprs <- list()
+exprs_trans <- list()
+
+for (i in 1:length(files_allg)) {
+  exprs[[i]] <- read.table(paste0(files_allg[i]), col.names = c("gene_id", names(files_allg)[i]), check.names = FALSE)
+}
+
+merged_exprs <- Reduce(function(x, y) merge(x, y, by = "gene_id"), exprs)
+merged_exprs <- merged_exprs[-nrow(merged_exprs), ]
+write.csv(merged_exprs, file = paste0(wkdir, "/results/RNA_counts/allgene_count_matrix.txt"),row.names = FALSE)
+....
+```
+*完整代码参考 [github](https://github.com/RachelYue96/RNA-SEQ-tutorial) `src/summary_counts.r` 脚本*
+
+### 结果文件 ###
+- 基因表达矩阵
+  
+![alt text](images/gene_counts.png)
+
+## 第五步：画图，差异基因分析及通路分析
+在RNA-Seq分析中，我们经常关心不同条件下基因表达的变化。差异基因表达分析可以帮助我们识别在不同样本组之间表达量显著不同的基因。这对于理解生物学过程、疾病机制以及药物作用至关重要
+
+*完整代码参考 [github](https://github.com/RachelYue96/RNA-SEQ-tutorial) `src/step5_plots.sh` 脚本*
+
+### 差异基因分析核心代码 ###
+```r
+library(DESeq2)
+library(clusterProfiler)
+library('biomaRt')
+
+# Set the working directory
+wkdir <- "/share/result/sequencer/salus/video_example/RNA-seq/"
+setwd(wkdir)
+
+# 使用read.table()函数导入上一步生成的基因表达矩阵
+outputPrefix <- "results/pipe_plots/"
+dir.create(paste0(wkdir, outputPrefix))
+
+countdata <- read.table("results/RNA_counts/allgene_count_matrix.txt", header=TRUE, row.names=1, check.names=FALSE, sep=",")
+countdata <- as.matrix(countdata)
+
+# 定义样本名称和样本的实验条件，区分实验组和对照组
+samples <- c('alt-1', 'alt-2', 'alt-3', 'con-1', 'con-2', 'con-3')
+conditions <- c('Treated', 'Treated', 'Treated', 'Control', 'Control', 'Control')
+coldata <- DataFrame(condition = factor(conditions), row.names = samples)
+
+# 使用DESeq()函数执行差异表达分析
+ddsHTSeq <- DESeqDataSetFromMatrix(countData = countdata, colData = coldata, design = ~ condition)
+dds <- DESeq(ddsHTSeq)
+
+#######################################################
+# 再通过一系列代码处理差异表达分析的结果，包括排序、转换数据格式、映射基因ID，过滤p值或padj值为NA的数据等等，便于下一步的富集分析
+```
+
+### 差异基因分析结果文件 ###
+- 差异基因结果表格, 包括了：不同条件之间的表达倍数变化， log2 fold change 的标准误差，统计检验值，未经校正的 p 值和 经过多重假设检验校正后的调整 p 值
+![alt text](images/DEG.png)
+
+- 可以通过对padj和log2 fold change设定阈值筛选差异基因集。根据筛选后的差异基因集，绘制PCA图，热图等一系列图来识别是否包含异常样本，对照组和实验组之间是否存在显著的差异基因表达
+    1. PCA图 *(识别是否包含异常样本)*
+
+    ![alt text](images/pca.png)
+
+    2. 热图 *(对照组和实验组之间是否存在显著的差异基因表达)*
+
+    ![alt text](images/heatmap.png)
+
+### 富集分析核心代码 ###
+```r
+library(DOSE)
+generate_dotplot <- function(ont) {
+  gse <- gseGO(geneList=kegg_gene_list,
+               ont = ont,
+               keyType = "ENTREZID",
+               minGSSize = 3,
+               maxGSSize = 800,
+               pvalueCutoff = 0.05,
+               verbose = TRUE,
+               OrgDb = org.Hs.eg.db,
+               pAdjustMethod = "none")
+  gse_df <- as.data.frame(gse)
+  dir.create(paste0(wkdir, "/results/pipe_plots/GO/"))
+  write.csv(gse_df, file = paste0(wkdir, "/results/pipe_plots/GO/", "GSE_GO_", ont, "_2exclude.csv"))
+  p <- dotplot(gse, showCategory=10, split=".sign", color="pvalue") + facet_grid(.~.sign) + ggtitle(ont)
+  ggsave(paste0(wkdir, "/results/pipe_plots/GO/", "GSE_GO_", ont, "_2exclude.png"), plot = p, width = 9, height = 12, dpi = 300)
+}
+
+# GO注释会根据三种功能大类【分子生物学功能（Molecular Function，MF）、生物学过程（Biological Process，BP）和细胞学组分（Cellular Components，CC）】
+generate_dotplot('BP')
+generate_dotplot('CC')
+generate_dotplot('MF')
+
+# KEGG
+res <- gseKEGG(
+  kegg_gene_list,    # 根据logFC排序的基因集
+  organism = "hsa",    # 人的拉丁名缩写
+  minGSSize = 3,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "none"
+)
+res_df <- as.data.frame(res)
+dir.create(paste0(wkdir, "/results/pipe_plots/KEGG/"))
+write.csv(res_df, file = paste0(wkdir, "/results/pipe_plots/KEGG/", "GSE_KEGG_2exclude.csv"))
+
+k <- dotplot(
+  res,
+  showCategory=10,
+  color="pvalue",
+  split=".sign") + facet_grid(.~.sign) + ggtitle("KEGG")
+ggsave(paste0(wkdir, "/results/pipe_plots/KEGG/", "GSE_KEGG_2exclude.png"), plot = k, width = 9, height = 12, dpi = 300)
+```
+
+### 富集分析结果文件 ###
+1. GO - BP
+
+![alt text](images/go-bp.png)
+
+2. KEGG
+
+![alt text](images/kegg.png)
 
