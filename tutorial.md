@@ -189,6 +189,7 @@ featureCounts \
     -a /share/data/reference/human/hg38/gene/UHRR/ref/Homo_sapiens.GRCh38.110.mRNA.gtf \
     ## 指定输出文件
     -o $ddir/${sampleid}_gene_level_counts
+    $ddir/${sampleid}.tran.sorted.bam ## 指定输入文件
 
 less $ddir/${sampleid}_gene_level_counts | grep '^E' | awk '{print \$1\"\\t\"\$NF}' | awk '{sums[\$1] += \$2} END {for (i in sums) print i, sums[i]}' | sort -k1 > $ddir/${sampleid}_allgene.counts.txt
 
